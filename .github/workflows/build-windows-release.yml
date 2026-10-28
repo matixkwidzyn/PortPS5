@@ -1,0 +1,83 @@
+name: Build Windows Release Package
+
+on:
+  push:
+    branches:
+      - build/windows-release-artifact-20261028
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-release:
+    name: Compile and package PortPS5
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Install pinned MinGW GCC 15.2 and submodules
+        uses: ./.github/actions/mingw-setup
+
+      - name: Check compiler and tools
+        shell: pwsh
+        run: |
+          g++ --version
+          cmake --version
+          ninja --version
+
+      - name: Configure release
+        run: cmake --preset release
+
+      - name: Build release
+        run: cmake --build --preset release --parallel 4
+
+      - name: Verify and package shipping binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'build/release/core'
+          $exe = Join-Path $root 'relinker/relinker.exe'
+          $libdir = Join-Path $root 'libs/libs'
+          if (-not (Test-Path $exe)) { throw "Missing compiled relinker.exe: $exe" }
+          if (-not (Test-Path $libdir)) { throw "Missing compiled libraries directory: $libdir" }
+          $prx = @(Get-ChildItem -Path $libdir -File -Filter '*.prx')
+          if ($prx.Count -eq 0) { throw "No patched .prx libraries were built" }
+          New-Item -ItemType Directory -Force 'dist/PortPS5/libs' | Out-Null
+          Copy-Item $exe 'dist/PortPS5/relinker.exe'
+          Copy-Item $prx.FullName 'dist/PortPS5/libs/' -Force
+          Get-ChildItem -Path $libdir -File -Filter '*.dll' | Copy-Item -Destination 'dist/PortPS5/libs/' -Force
+          foreach ($dll in @('libgcc_s_seh-1.dll', 'libstdc++-6.dll', 'libwinpthread-1.dll')) {
+            $source = Join-Path 'C:/mingw64/bin' $dll
+            if (Test-Path $source) { Copy-Item $source 'dist/PortPS5/libs/' -Force }
+          }
+          Copy-Item -Path 'config' -Destination 'dist/PortPS5/config' -Recurse -Force
+          @'
+          PortPS5 Windows Release (GitHub Actions)
+          This package is a developer CLI tool, not an emulator GUI.
+          Requires a legally obtained, already-decrypted PS5 game dump.
+          Read docs/USER_GUIDE.md in the source repository.
+          The relinker expects eboot.elf (not encrypted eboot.bin).
+          On Intel CPUs use --to-intel for converted games.
+          Build is not a guarantee of game compatibility.
+          '@ | Set-Content -Path 'dist/PortPS5/README.txt'
+          $magic = [System.IO.File]::ReadAllBytes('dist/PortPS5/relinker.exe')
+          if ($magic.Length -lt 2 -or $magic[0] -ne 0x4d -or $magic[1] -ne 0x5a) { throw "relinker.exe is not a PE executable" }
+          Get-ChildItem -Path 'dist/PortPS5' -Recurse -File | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $($_.Path.Replace((Resolve-Path 'dist/PortPS5').Path + [IO.Path]::DirectorySeparatorChar, ''))" } |
+            Set-Content -Path 'dist/PortPS5/SHA256SUMS.txt'
+          Write-Host "Packaged $($prx.Count) .prx libraries."
+          Get-ChildItem -Path 'dist/PortPS5' -Recurse -File | Select-Object FullName,Length
+
+      - name: Upload compiled Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: PortPS5-Windows-Release
+          path: dist/PortPS5/
+          if-no-files-found: error
+          retention-days: 14
